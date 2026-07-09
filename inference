@@ -1,0 +1,275 @@
+# coding=utf-8
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
+"""批量推理 control_eval_v6.jsonl（可控 TTS 评测集）。
+
+由单条 voice-clone 推理脚本（examples/test_model_12hz_base.py）改造：
+- 读取 control_eval_v6.jsonl 逐条合成；**暂时跳过“语速”维度**。
+- 每条需要一个 ref_audio：从另一份参考 jsonl 里挑“情感相同”的随机条目。
+  参考 jsonl 每条格式为 {"audio_path": ..., "text": ...}，其情感与测试集一样，
+  直接写在 text 的【xx】标签里（如【happy1】/【neutral】）。按“基础情感”（去掉档位数字）匹配。
+- 情感/复合维度：从测试文本开头的【tag】解析目标情感；
+  副语言/韵律/音量维度：无情感标注，统一用 neutral 参考。
+
+用法：
+    python infer_control_eval_v6.py \
+        --model /path/to/controllable_ckpt \
+        --ref_jsonl /path/to/ref_with_emotion.jsonl \
+        --input control_eval_v6.jsonl \
+        --out_dir v6_infer_out \
+        [--batch_size 8] [--limit 0] [--seed 0]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import soundfile as sf
+import torch
+
+from qwen_tts import Qwen3TTSModel  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+
+# 从 text 里解析情感标签【xxx】，取基础情感（字母部分，忽略档位数字）
+EMO_TAG_RE = re.compile(r"【([A-Za-z]+?)(\d*)】")
+# 已知支持情感（用于校验 / 兜底）
+KNOWN_EMOTIONS = {
+    "happy", "sad", "angry", "fearful", "surprised",
+    "disgusted", "excited", "anxiety", "neutral", "calm",
+}
+EMO_MAP = {
+    "fearful": "fear",
+    "angry": "anger",
+    "calm": "calmness",
+    "excited": "excitement",
+    "surprised": "surprise",
+    "sad": "sadness",
+    "disgusted": "disgust",
+}
+
+# 生成超参（沿用 base 示例）
+# COMMON_GEN_KWARGS = dict(
+#     max_new_tokens=2048,
+#     do_sample=True,
+#     top_k=50,
+#     top_p=1.0,
+#     temperature=0.9,
+#     repetition_penalty=1.05,
+#     subtalker_dosample=True,
+#     subtalker_top_k=50,
+#     subtalker_top_p=1.0,
+#     subtalker_temperature=0.9,
+# )
+
+def base_emotion_from_text(text: str) -> str | None:
+    """取文本中第一个【tag】的基础情感名（小写）；无标签返回 None。"""
+    m = EMO_TAG_RE.search(text or "")
+    if not m:
+        return None
+    return m.group(1).lower()
+
+def target_emotion_for_entry(rec: dict) -> str:
+    """测试条目应匹配的参考情感（基础名）。
+
+    - 情感/复合：输入文本开头的【tag】里带情感；
+    - 副语言/韵律/音量：无情感标注 -> neutral。
+    """
+    emo = base_emotion_from_text(rec.get("输入文本", ""))
+    if emo:
+        return emo
+    return "neutral"
+
+def load_ref_pool(ref_jsonl: Path) -> tuple[dict[str, list[dict]], list[dict]]:
+    """读取参考 jsonl，按基础情感分桶。返回 (pool_by_emotion, all_entries)。"""
+    pool: dict[str, list[dict]] = defaultdict(list)
+    all_entries: list[dict] = []
+    with ref_jsonl.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            ap = "/home/ma-user/work/dataset/csh_bj/BB03/" + rec.get("audio_path")
+            tx = rec.get("text", "")
+            if not ap:
+                continue
+            entry = {"audio_path": ap, "text": tx}
+            all_entries.append(entry)
+            emo = base_emotion_from_text(tx)
+            if emo:
+                pool[emo].append(entry)
+    return pool, all_entries
+
+def pick_ref(
+    emotion: str,
+    pool: dict[str, list[dict]],
+    all_entries: list[dict],
+    rng: random.Random,
+) -> tuple[dict, str]:
+    """按情感随机取一条参考；缺失时回退 neutral，再回退全库。返回 (entry, 实际来源)。"""
+    if emotion.replace("1", "").replace("3", "") in EMO_MAP:
+        emo_ = EMO_MAP[emotion.replace("1", "").replace("3", "")]
+    else:
+        emo_ = emotion
+    if pool.get(emo_):
+        return rng.choice(pool[emo_]), emotion
+    if pool.get("neutral"):
+        return rng.choice(pool["neutral"]), "neutral(fallback)"
+    return rng.choice(all_entries), "any(fallback)"
+
+def load_tasks(input_jsonl: Path, skip_dims: set[str], start: int, end: int) -> list[dict]:
+    tasks: list[dict] = []
+    with input_jsonl.open(encoding="utf-8") as f:
+        for line in f.readlines()[start:end]:
+            line = line.strip()
+            if not line:
+                continue
+            print(line)
+            rec = json.loads(line)
+            if rec.get("评测维度") in skip_dims:
+                continue
+            tasks.append(rec)
+    return tasks
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="/home/ma-user/work/dataset/csh_bj/jiangziyue/Qwen3-TTS/script/ckpt/pretrain_v14/checkpoint-step-3800", help="可控 TTS 模型/权重路径")
+    ap.add_argument("--ref_jsonl", default="/home/ma-user/work/dataset/csh_bj/BB03/BB03_51h_cleaned.jsonl", help="参考音频 jsonl（每条 {audio_path,text}，情感在 text 的【tag】里）")
+    ap.add_argument("--input", default=str(HERE / "control_eval_v1.jsonl"))
+    ap.add_argument("--out_dir", default=str(HERE / "infer_out_v1"))
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--language", default="Auto")
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--start", type=int, default=0, help="只跑前 N 条（0=全部）")
+    ap.add_argument("--end", type=int, default=0, help="只跑前 N 条（0=全部）")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--x_vector_only", default=True, help="只用音色 embedding，不做 ICL（默认关闭=ICL）")
+    ap.add_argument("--skip_dims", default="语速", help="跳过的评测维度，逗号分隔（默认跳过语速）")
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+    skip_dims = {d.strip() for d in args.skip_dims.split(",") if d.strip()}
+
+    input_jsonl = Path(args.input)
+    ref_jsonl = Path(args.ref_jsonl)
+    out_dir = Path(args.out_dir)
+    wav_dir = out_dir / "wavs"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+
+    tasks = load_tasks(input_jsonl, skip_dims, args.start, args.end)
+    pool, all_entries = load_ref_pool(ref_jsonl)
+    if not all_entries:
+        raise RuntimeError(f"参考 jsonl 为空或无有效条目: {ref_jsonl}")
+
+    print(f"待合成条目: {len(tasks)}（已跳过维度: {sorted(skip_dims)}）")
+    print(f"参考池情感分布: {{ {', '.join(f'{k}:{len(v)}' for k, v in sorted(pool.items()))} }}，总计 {len(all_entries)}")
+
+    # 为每条任务预先选好参考，便于批处理与记录
+    for t in tasks:
+        emo = target_emotion_for_entry(t)
+        ref, src = pick_ref(emo, pool, all_entries, rng)
+        print(ref, t)
+        t["_target_emotion"] = emo
+        t["_ref_audio"] = ref["audio_path"]
+        t["_ref_text"] = ref["text"]
+        t["_ref_src"] = src
+
+        if "ref_audio" in t:
+            t["_ref_audio"] = t["ref_audio"]
+            src = emo
+
+    # 加载模型
+    print(f"加载模型: {args.model}")
+    tts = Qwen3TTSModel.from_pretrained(
+        args.model,
+        device_map=args.device,
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
+
+    manifest_path = out_dir / "manifest.jsonl"
+    n_ok, n_err = 0, 0
+    t_start = time.time()
+    with manifest_path.open("w", encoding="utf-8") as mf:
+        for i in range(0, len(tasks), args.batch_size):
+            batch = tasks[i:i + args.batch_size]
+            texts = [b["输入文本"] for b in batch]
+            langs = [args.language] * len(batch)
+            ref_audios = [b["_ref_audio"] for b in batch]
+            xvo = [args.x_vector_only] * len(batch)
+            # try:
+            #     wavs, sr = tts.generate_voice_clone(
+            #         text=texts,
+            #         language=langs,
+            #         ref_audio=ref_audios,
+            #         x_vector_only_mode=xvo,
+            #         **COMMON_GEN_KWARGS,
+            #     )
+            # except Exception as exc:  # noqa: BLE001
+                # print(f"[batch {i}-{i+len(batch)-1}] 批处理失败，逐条重试: {exc}", file=sys.stderr)
+            batch = [b for b in batch if not os.path.exists(f"/home/ma-user/work/dataset/csh_bj/jiangziyue/Qwen3-TTS/script/infer_out_v1/wavs_ready/{b['ID']}.wav")]
+            wavs, sr = _fallback_per_item(tts, batch, args)
+
+            for b, w in zip(batch, wavs):
+                if w is None:
+                    n_err += 1
+                    continue
+                wav_name = f"{b['ID']}.wav"
+                sf.write(str(wav_dir / wav_name), w, sr)
+                rec = {
+                    "ID": b["ID"],
+                    "wav_path": str(wav_dir / wav_name),
+                    "评测维度": b["评测维度"],
+                    "控制值": b.get("控制值", ""),
+                    "强度": b.get("强度", ""),
+                    "期望标记": b.get("期望标记", ""),
+                    "输入文本": b["输入文本"],
+                    "target_emotion": b["_target_emotion"],
+                    "ref_audio": b["_ref_audio"],
+                    "ref_text": b["_ref_text"],
+                    "ref_src": b["_ref_src"],
+                }
+                mf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                mf.flush()
+                n_ok += 1
+            print(f"  进度 {min(i+len(batch), len(tasks))}/{len(tasks)}  ok={n_ok} err={n_err}")
+
+    dt = time.time() - t_start
+    print(f"\n完成：ok={n_ok} err={n_err}，用时 {dt:.1f}s")
+    print(f"音频目录: {wav_dir}")
+    print(f"清单: {manifest_path}")
+
+def _fallback_per_item(tts, batch: list[dict], args) -> tuple[list, int]:
+    """批处理失败时逐条合成，失败的条目对应 None。"""
+    wavs: list = []
+    sr = 24000
+    for b in batch:
+        try:
+            w, sr = tts.generate_voice_clone(
+                text=b["输入文本"],
+                language=args.language,
+                ref_audio=b["_ref_audio"],
+                ref_text=b["_ref_text"],
+                x_vector_only_mode=args.x_vector_only,
+                non_streaming_mode=True,
+                # **COMMON_GEN_KWARGS,
+            )
+            wavs.append(w[0])
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [{b['ID']}] 单条失败: {exc}", file=sys.stderr)
+            wavs.append(None)
+    return wavs, sr
+
+if __name__ == "__main__":
+    main()
+
+
