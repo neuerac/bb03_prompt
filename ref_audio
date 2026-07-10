@@ -8,3 +8,7 @@ calm:
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-审慎思考-002/000001.wav"
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-平和处理-001/000001.wav"
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-平和处理-001/000002.wav"
+(hf_upload) [ma-user script]$hf download llyee/build_data/wavs_ready.zip --local-dir ./infer_out_v1 --repo-type d
+ataset
+Error: Invalid value. Repo id must be in the form 'repo_name' or 'namespace/repo_name': 'llyee/build_data/wavs_ready.zip'. Use `repo_type` argument if needed.
+Hint: set HF_DEBUG=1 as environment variable for full traceback.
