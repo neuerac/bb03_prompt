@@ -8,7 +8,35 @@ calm:
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-审慎思考-002/000001.wav"
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-平和处理-001/000001.wav"
 "BB03/1114/多情感单轮文本递进/目标/单句/多情感单轮冷静-目标音色-平和处理-001/000002.wav"
-(hf_upload) [ma-user script]$hf download llyee/build_data/wavs_ready.zip --local-dir ./infer_out_v1 --repo-type d
-ataset
-Error: Invalid value. Repo id must be in the form 'repo_name' or 'namespace/repo_name': 'llyee/build_data/wavs_ready.zip'. Use `repo_type` argument if needed.
-Hint: set HF_DEBUG=1 as environment variable for full traceback.
+python - <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+src_dir = Path("wavs")
+dst_dir = Path("wavs_ready")
+ids_file = Path("selected_new_ids.txt")
+
+dst_dir.mkdir(exist_ok=True)
+ids = [line.strip() for line in ids_file.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+
+missing = []
+copied = 0
+
+for item_id in ids:
+    src = src_dir / f"{item_id}.wav"
+    dst = dst_dir / f"{item_id}.wav"
+
+    if not src.is_file():
+        missing.append(item_id)
+        continue
+
+    shutil.copy2(src, dst)  # 覆盖同名旧 WAV
+    copied += 1
+
+print(f"已复制/覆盖: {copied}")
+if missing:
+    print("缺失源文件:")
+    print("\n".join(missing))
+    sys.exit(1)
+PY
