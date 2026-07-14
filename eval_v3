@@ -1,4 +1,1 @@
-python export_calm_reference_wavs.py \
-  --bb03_jsonl /home/ma-user/work/dataset/csh_bj/BB03/BB03_51h_cleaned.jsonl \
-  --bb03_root /home/ma-user/work/dataset/csh_bj/BB03 \
-  --out_dir calm_reference_wavs
+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
