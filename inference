@@ -40,23 +40,22 @@ from qwen_tts import Qwen3TTSModel  # noqa: E402
 HERE = Path(__file__).resolve().parent
 
 # 从 text 里解析情感标签【xxx】，取基础情感（字母部分，忽略档位数字）
-EMO_TAG_RE = re.compile(r"【([A-Za-z]+?)(\d*)】")
-# 已知支持情感（用于校验 / 兜底）
-KNOWN_EMOTIONS = {
-    "happy", "sad", "angry", "fearful", "surprised",
-    "disgusted", "excited", "anxiety", "neutral", "calm",
-}
-EMO_MAP = {
-    "fearful": "fear",
-    "angry": "anger",
-    "calm": "calmness",
-    "excited": "excitement",
-    "surprised": "surprise",
-    "sad": "sadness",
-    "disgusted": "disgust",
-}
+# 从 text 里解析情绪标签【xxx】。1/2/3 是强度档位；无数字表示没有强度约束。
+EMO_TAG_RE = re.compile(r"【([A-Za-z ]+?)([123]?)】")
 
-# 生成超参（沿用 base 示例）
+# 测试集与 BB03 的同义情绪名统一到 BB03 使用的基础名。
+EMOTION_ALIASES = {
+    "happy": "happy",
+    "sad": "sadness", "sadness": "sadness",
+    "angry": "anger", "anger": "anger",
+    "fearful": "fear", "fear": "fear",
+    "surprised": "surprise", "surprise": "surprise",
+    "disgusted": "disgust", "disgust": "disgust",
+    "excited": "excitement", "excitement": "excitement",
+    "anxiety": "anxiety",
+    "neutral": "neutral",
+    "calm": "calmness", "calmness": "calmness",
+}
 # COMMON_GEN_KWARGS = dict(
 #     max_new_tokens=2048,
 #     do_sample=True,
@@ -70,61 +69,83 @@ EMO_MAP = {
 #     subtalker_temperature=0.9,
 # )
 
-def base_emotion_from_text(text: str) -> str | None:
-    """取文本中第一个【tag】的基础情感名（小写）；无标签返回 None。"""
-    m = EMO_TAG_RE.search(text or "")
-    if not m:
-        return None
-    return m.group(1).lower()
+def parse_emotion_tags(text: str) -> list[tuple[str, str | None]]:
+    """提取可识别的标签，返回规范化的 (基础情绪, 强度) 列表。"""
+    tags: list[tuple[str, str | None]] = []
+    for raw_emotion, intensity in EMO_TAG_RE.findall(text or ""):
+        emotion = EMOTION_ALIASES.get(raw_emotion.strip().lower())
+        if emotion:
+            tags.append((emotion, intensity or None))
+    return tags
 
-def target_emotion_for_entry(rec: dict) -> str:
-    """测试条目应匹配的参考情感（基础名）。
 
-    - 情感/复合：输入文本开头的【tag】里带情感；
-    - 副语言/韵律/音量：无情感标注 -> neutral。
+def target_emotion_for_entry(rec: dict) -> tuple[str, str | None]:
+    """返回目标的 (情绪, 强度)；没有情绪标签的条目默认 neutral、无强度。"""
+    tags = parse_emotion_tags(rec.get("输入文本", ""))
+    return tags[0] if tags else ("neutral", None)
+
+
+def load_ref_pool(ref_jsonl: Path) -> dict[str, dict[str | None, list[dict]]]:
+    """只读取纯单一情绪参考，并按基础情绪和强度分桶。
+
+    纯单一情绪：一条 BB03 文本中恰好存在一个【...】标签，且该标签是可识别的
+    目标情绪。任何含有多个情绪或其它情绪标签的文本都会被排除。
     """
-    emo = base_emotion_from_text(rec.get("输入文本", ""))
-    if emo:
-        return emo
-    return "neutral"
-
-def load_ref_pool(ref_jsonl: Path) -> tuple[dict[str, list[dict]], list[dict]]:
-    """读取参考 jsonl，按基础情感分桶。返回 (pool_by_emotion, all_entries)。"""
-    pool: dict[str, list[dict]] = defaultdict(list)
-    all_entries: list[dict] = []
+    pool: dict[str, dict[str | None, list[dict]]] = defaultdict(lambda: defaultdict(list))
     with ref_jsonl.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
-            ap = "/home/ma-user/work/dataset/csh_bj/BB03/" + rec.get("audio_path")
-            tx = rec.get("text", "")
-            if not ap:
+            audio_rel = rec.get("audio_path", "")
+            text = rec.get("text", "")
+            if not audio_rel:
                 continue
-            entry = {"audio_path": ap, "text": tx}
-            all_entries.append(entry)
-            emo = base_emotion_from_text(tx)
-            if emo:
-                pool[emo].append(entry)
-    return pool, all_entries
+
+            # 先数全部标签，避免把 happy + neutral 或 happy + interest 当成纯 happy。
+            if len(EMO_TAG_RE.findall(text)) != 1:
+                continue
+            tags = parse_emotion_tags(text)
+            if len(tags) != 1:
+                continue
+
+            emotion, intensity = tags[0]
+            pool[emotion][intensity].append({
+                "audio_path": "/home/ma-user/work/dataset/csh_bj/BB03/" + audio_rel,
+                "text": text,
+                "emotion": emotion,
+                "intensity": intensity,
+            })
+    return pool
+
 
 def pick_ref(
     emotion: str,
-    pool: dict[str, list[dict]],
-    all_entries: list[dict],
+    intensity: str | None,
+    pool: dict[str, dict[str | None, list[dict]]],
     rng: random.Random,
 ) -> tuple[dict, str]:
-    """按情感随机取一条参考；缺失时回退 neutral，再回退全库。返回 (entry, 实际来源)。"""
-    if emotion.replace("1", "").replace("3", "") in EMO_MAP:
-        emo_ = EMO_MAP[emotion.replace("1", "").replace("3", "")]
+    """严格选择纯情绪参考。
+
+    有强度的目标（如 happy3）只能从同一强度中选择；无强度目标（如 happy）
+    才从该纯情绪的所有强度中随机选择。没有匹配时直接报错，绝不跨情绪或跨强度。
+    """
+    by_intensity = pool.get(emotion, {})
+    if intensity is None:
+        candidates = [entry for entries in by_intensity.values() for entry in entries]
+        source = f"{emotion}(pure, any intensity)"
     else:
-        emo_ = emotion
-    if pool.get(emo_):
-        return rng.choice(pool[emo_]), emotion
-    if pool.get("neutral"):
-        return rng.choice(pool["neutral"]), "neutral(fallback)"
-    return rng.choice(all_entries), "any(fallback)"
+        candidates = by_intensity.get(intensity, [])
+        source = f"{emotion}{intensity}(pure, exact intensity)"
+
+    if not candidates:
+        raise RuntimeError(
+            f"没有可用的纯参考：emotion={emotion!r}, intensity={intensity!r}。"
+            "为避免混合情绪或错误强度，已停止推理。"
+        )
+    return rng.choice(candidates), source
+
 
 def load_tasks(input_jsonl: Path, skip_dims: set[str], start: int, end: int) -> list[dict]:
     tasks: list[dict] = []
@@ -146,6 +167,7 @@ def main() -> None:
     ap.add_argument("--ref_jsonl", default="/home/ma-user/work/dataset/csh_bj/BB03/BB03_51h_cleaned.jsonl", help="参考音频 jsonl（每条 {audio_path,text}，情感在 text 的【tag】里）")
     ap.add_argument("--input", default=str(HERE / "control_eval_v1.jsonl"))
     ap.add_argument("--out_dir", default=str(HERE / "infer_out_v1"))
+    ap.add_argument("--ready_dir", default="", help="已有合格 WAV 目录；默认 <out_dir>/wavs_ready")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--language", default="Auto")
     ap.add_argument("--batch_size", type=int, default=8)
@@ -163,29 +185,41 @@ def main() -> None:
     ref_jsonl = Path(args.ref_jsonl)
     out_dir = Path(args.out_dir)
     wav_dir = out_dir / "wavs"
+    ready_dir = Path(args.ready_dir) if args.ready_dir else out_dir / "wavs_ready"
     wav_dir.mkdir(parents=True, exist_ok=True)
 
     tasks = load_tasks(input_jsonl, skip_dims, args.start, args.end)
-    pool, all_entries = load_ref_pool(ref_jsonl)
-    if not all_entries:
-        raise RuntimeError(f"参考 jsonl 为空或无有效条目: {ref_jsonl}")
+    pool = load_ref_pool(ref_jsonl)
+    if not pool:
+        raise RuntimeError(f"参考 jsonl 为空或没有纯单一情绪条目: {ref_jsonl}")
 
     print(f"待合成条目: {len(tasks)}（已跳过维度: {sorted(skip_dims)}）")
-    print(f"参考池情感分布: {{ {', '.join(f'{k}:{len(v)}' for k, v in sorted(pool.items()))} }}，总计 {len(all_entries)}")
-
+    summary_parts = []
+    for emotion, by_intensity in sorted(pool.items()):
+        levels = ", ".join(
+            f"{level or 'none'}:{len(entries)}"
+            for level, entries in sorted(by_intensity.items(), key=lambda item: item[0] or "")
+        )
+        summary_parts.append(f"{emotion}({levels})")
+    print(f"纯单一情绪参考池: {{ {', '.join(summary_parts)} }}")
     # 为每条任务预先选好参考，便于批处理与记录
     for t in tasks:
-        emo = target_emotion_for_entry(t)
-        ref, src = pick_ref(emo, pool, all_entries, rng)
+        emotion, intensity = target_emotion_for_entry(t)
+        t["_target_emotion"] = emotion
+        t["_target_intensity"] = intensity
+
+        if t.get("ref_audio"):
+            # 人工指定的参考音频优先，避免被随机选择覆盖。
+            t["_ref_audio"] = t["ref_audio"]
+            t["_ref_text"] = t.get("ref_text", "")
+            t["_ref_src"] = "manual(ref_audio)"
+            continue
+
+        ref, src = pick_ref(emotion, intensity, pool, rng)
         print(ref, t)
-        t["_target_emotion"] = emo
         t["_ref_audio"] = ref["audio_path"]
         t["_ref_text"] = ref["text"]
         t["_ref_src"] = src
-
-        if "ref_audio" in t:
-            t["_ref_audio"] = t["ref_audio"]
-            src = emo
 
     # 加载模型
     print(f"加载模型: {args.model}")
@@ -216,7 +250,7 @@ def main() -> None:
             #     )
             # except Exception as exc:  # noqa: BLE001
                 # print(f"[batch {i}-{i+len(batch)-1}] 批处理失败，逐条重试: {exc}", file=sys.stderr)
-            batch = [b for b in batch if not os.path.exists(f"/home/ma-user/work/dataset/csh_bj/jiangziyue/Qwen3-TTS/script/infer_out_v1/wavs_ready/{b['ID']}.wav")]
+            batch = [b for b in batch if not (ready_dir / f"{b['ID']}.wav").exists()]
             wavs, sr = _fallback_per_item(tts, batch, args)
 
             for b, w in zip(batch, wavs):
@@ -234,6 +268,7 @@ def main() -> None:
                     "期望标记": b.get("期望标记", ""),
                     "输入文本": b["输入文本"],
                     "target_emotion": b["_target_emotion"],
+                    "target_intensity": b["_target_intensity"],
                     "ref_audio": b["_ref_audio"],
                     "ref_text": b["_ref_text"],
                     "ref_src": b["_ref_src"],
@@ -271,5 +306,4 @@ def _fallback_per_item(tts, batch: list[dict], args) -> tuple[list, int]:
 
 if __name__ == "__main__":
     main()
-
 
