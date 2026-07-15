@@ -42,6 +42,12 @@ HERE = Path(__file__).resolve().parent
 # 从 text 里解析情感标签【xxx】，取基础情感（字母部分，忽略档位数字）
 # 从 text 里解析情绪标签【xxx】。1/2/3 是强度档位；无数字表示没有强度约束。
 EMO_TAG_RE = re.compile(r"【([A-Za-z ]+?)([123]?)】")
+# 排除会直接引入额外情绪或副语言的标记；允许呼吸、停顿和重读标注，
+# 否则部分情绪强度档位在 BB03 中没有足够的纯情绪候选。
+REF_EVENT_RE = re.compile(
+    r"\[(?!(?:breath|hold)\])[^\]]+\]|<(?!/?stress>)[^>]+>",
+    re.IGNORECASE,
+)
 
 # 测试集与 BB03 的同义情绪名统一到 BB03 使用的基础名。
 EMOTION_ALIASES = {
@@ -89,7 +95,9 @@ def load_ref_pool(ref_jsonl: Path) -> dict[str, dict[str | None, list[dict]]]:
     """只读取纯单一情绪参考，并按基础情绪和强度分桶。
 
     纯单一情绪：一条 BB03 文本中恰好存在一个【...】标签，且该标签是可识别的
-    目标情绪。任何含有多个情绪或其它情绪标签的文本都会被排除。
+    目标情绪。任何含有多个情绪或其它情绪标签，或含 [laugh]、[cry]、[sigh]、
+    [humgh]、[clucking]、<laugh> 等会直接改变音色的副语言标记都会被排除；
+    [breath]、[hold]、<stress> 仅表示韵律，允许保留以维持参考池覆盖度。
     """
     pool: dict[str, dict[str | None, list[dict]]] = defaultdict(lambda: defaultdict(list))
     with ref_jsonl.open(encoding="utf-8") as f:
@@ -105,6 +113,8 @@ def load_ref_pool(ref_jsonl: Path) -> dict[str, dict[str | None, list[dict]]]:
 
             # 先数全部标签，避免把 happy + neutral 或 happy + interest 当成纯 happy。
             if len(EMO_TAG_RE.findall(text)) != 1:
+                continue
+            if REF_EVENT_RE.search(text):
                 continue
             tags = parse_emotion_tags(text)
             if len(tags) != 1:
@@ -188,12 +198,14 @@ def main() -> None:
     ready_dir = Path(args.ready_dir) if args.ready_dir else out_dir / "wavs_ready"
     wav_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = load_tasks(input_jsonl, skip_dims, args.start, args.end)
+    all_tasks = load_tasks(input_jsonl, skip_dims, args.start, args.end)
+    tasks = [task for task in all_tasks if not (ready_dir / f"{task['ID']}.wav").exists()]
+    skipped_ready = len(all_tasks) - len(tasks)
     pool = load_ref_pool(ref_jsonl)
     if not pool:
         raise RuntimeError(f"参考 jsonl 为空或没有纯单一情绪条目: {ref_jsonl}")
 
-    print(f"待合成条目: {len(tasks)}（已跳过维度: {sorted(skip_dims)}）")
+    print(f"待合成条目: {len(tasks)}（已跳过已有 WAV: {skipped_ready}；已跳过维度: {sorted(skip_dims)}）")
     summary_parts = []
     for emotion, by_intensity in sorted(pool.items()):
         levels = ", ".join(
@@ -250,7 +262,6 @@ def main() -> None:
             #     )
             # except Exception as exc:  # noqa: BLE001
                 # print(f"[batch {i}-{i+len(batch)-1}] 批处理失败，逐条重试: {exc}", file=sys.stderr)
-            batch = [b for b in batch if not (ready_dir / f"{b['ID']}.wav").exists()]
             wavs, sr = _fallback_per_item(tts, batch, args)
 
             for b, w in zip(batch, wavs):
