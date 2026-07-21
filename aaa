@@ -1,1 +1,5 @@
-
+python infer_neutral_ref_eval.py \
+  --model /path/to/controllable_ckpt \
+  --input eval_neutral_ref_50.jsonl \
+  --out_dir neutral_ref_out_50 \
+  --start 0 --end 50
